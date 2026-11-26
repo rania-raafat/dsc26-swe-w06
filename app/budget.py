@@ -1,41 +1,127 @@
 """Per-request cost estimate and a per-tenant daily spend cap for AI calls.
 
-Keep these names exactly (the public and hidden tests import them)."""
+Keep these names exactly (the public and hidden tests import them).
+"""
+
 from collections.abc import Callable
 from datetime import UTC, date, datetime
+from threading import RLock
 
 from app.providers import LLMProvider
 
 
-def estimate_cost_usd(provider: LLMProvider, prompt: str, max_output_tokens: int) -> float:
-    """Worst case: every allowed output token is produced.
+def estimate_cost_usd(
+    provider: LLMProvider,
+    prompt: str,
+    max_output_tokens: int,
+) -> float:
+    """Calculate the worst-case cost of a provider request."""
 
-    (count_tokens(prompt) * price_in_per_mtok + max_output_tokens * price_out_per_mtok) / 1e6
-    """
-    raise NotImplementedError
+    input_tokens = provider.count_tokens(prompt)
+
+    input_cost = input_tokens * provider.price_in_per_mtok
+    output_cost = max_output_tokens * provider.price_out_per_mtok
+
+    return (input_cost + output_cost) / 1_000_000
 
 
-def actual_cost_usd(provider: LLMProvider, prompt: str, output_tokens: int) -> float:
-    """The same formula with the tokens actually produced."""
-    raise NotImplementedError
+def actual_cost_usd(
+    provider: LLMProvider,
+    prompt: str,
+    output_tokens: int,
+) -> float:
+    """Calculate the actual cost using the tokens produced."""
+
+    input_tokens = provider.count_tokens(prompt)
+
+    input_cost = input_tokens * provider.price_in_per_mtok
+    output_cost = output_tokens * provider.price_out_per_mtok
+
+    return (input_cost + output_cost) / 1_000_000
 
 
 class DailyBudget:
-    """Per-tenant spend limit in USD. Budgets are per (tenant, today()) date; a new date
-    starts from zero."""
+    """Per-tenant spend limit in USD.
 
-    def __init__(self, limit_usd: float, today: Callable[[], date] = lambda: datetime.now(UTC).date()):
-        raise NotImplementedError
+    Budgets are independent for each (tenant, today()) date.
+    """
+
+    def __init__(
+        self,
+        limit_usd: float,
+        today: Callable[[], date] = lambda: datetime.now(UTC).date(),
+    ):
+        if limit_usd < 0:
+            raise ValueError("limit_usd cannot be negative")
+
+        self.limit_usd = float(limit_usd)
+        self.today = today
+
+        self._accounts: dict[tuple[str, date], dict[str, float]] = {}
+
+        self._lock = RLock()
+
+    def _get_account(self, tenant: str) -> dict[str, float]:
+        key = (tenant, self.today())
+
+        if key not in self._accounts:
+            self._accounts[key] = {
+                "spent": 0.0,
+                "reserved": 0.0,
+            }
+
+        return self._accounts[key]
 
     def remaining(self, tenant: str) -> float:
-        """How much `tenant` can still spend today."""
-        raise NotImplementedError
+        """Return the remaining budget for this tenant today."""
+
+        with self._lock:
+            account = self._get_account(tenant)
+
+            return max(
+                0.0,
+                self.limit_usd
+                - account["spent"]
+                - account["reserved"],
+            )
 
     def try_reserve(self, tenant: str, amount: float) -> bool:
-        """Reserve `amount` for `tenant` and return True, only if amount <= remaining(tenant)."""
-        raise NotImplementedError
+        """Reserve an amount only if the tenant can afford it."""
 
-    def settle(self, tenant: str, reserved: float, actual: float) -> None:
-        """Replace a reservation with the actual cost (actual may be 0, or more or less than
-        reserved)."""
-        raise NotImplementedError
+        if amount < 0:
+            raise ValueError("Reservation amount cannot be negative")
+
+        with self._lock:
+            account = self._get_account(tenant)
+
+            available = (
+                self.limit_usd
+                - account["spent"]
+                - account["reserved"]
+            )
+
+            if amount > available:
+                return False
+
+            account["reserved"] += amount
+            return True
+
+    def settle(
+        self,
+        tenant: str,
+        reserved: float,
+        actual: float,
+    ) -> None:
+        """Replace a reservation with the actual request cost."""
+
+        if reserved < 0 or actual < 0:
+            raise ValueError("Costs cannot be negative")
+
+        with self._lock:
+            account = self._get_account(tenant)
+
+            account["reserved"] -= reserved
+            account["spent"] += actual
+
+            if abs(account["reserved"]) < 1e-12:
+                account["reserved"] = 0.0
